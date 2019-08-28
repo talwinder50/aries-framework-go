@@ -9,6 +9,7 @@ package didexchange
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/hyperledger/aries-framework-go/pkg/common/metadata"
@@ -21,10 +22,17 @@ import (
 const (
 	// DIDExchange did exchange protocol
 	DIDExchange        = "didexchange"
-	connectionSpec     = metadata.AriesCommunityDID + ";spec/connections/1.0/"
+	connectionSpec     = metadata.AriesCommunityDID + ";spec/didexchange/1.0/"
 	connectionInvite   = connectionSpec + "invitation"
 	connectionRequest  = connectionSpec + "request"
 	connectionResponse = connectionSpec + "response"
+	//TODO : : Acknowledgement needs to follow RFCS-0015 for acks : https://github.com/hyperledger/aries-rfcs/tree/master/features/0015-acks
+	connectionAck  = connectionSpec + "ack"
+	nullState      = "null"
+	invitedState   = "invited"
+	requestedState = "requested"
+	respondedState = "responded"
+	completeState  = "completed"
 )
 
 // provider contains dependencies for the DID exchange protocol and is typically created by using aries.Context()
@@ -38,6 +46,22 @@ type Service struct {
 	store             storage.Store
 }
 
+//state defines a didcomm service state
+type state struct {
+	MsgType string `json:"@type"`
+	Current string
+}
+
+//key struct prepares the composite key for state persitance and lookup
+type key struct {
+	//protocol is defined in the msg type url for example "didexchange"
+	protocol string
+	//version is derived from msg type as well
+	version string
+	//thread id of the request
+	thid string
+}
+
 // New return didexchange service
 func New(store storage.Store, prov provider) *Service {
 	return &Service{outboundTransport: prov.OutboundTransport(), store: store}
@@ -45,20 +69,202 @@ func New(store storage.Store, prov provider) *Service {
 
 // Handle didexchange msg
 func (s *Service) Handle(msg dispatcher.DIDCommMsg) error {
-	// TODO add Handle logic
+	//populate request type, protocol, version required for composite key
+	msgType := strings.Split(msg.Type, "/")
+	pk := &key{
+		protocol: msgType[1],
+		version:  msgType[2],
+	}
+	switch msg.Type {
+	case connectionInvite:
+		invitation := &Invitation{}
+		err := json.Unmarshal(msg.Payload, invitation)
+		if err != nil {
+			return err
+		}
+		pk.thid = invitation.ID
+		state := &state{MsgType: invitation.Type, Current: ""}
+		return s.invitation(state, pk)
+	case connectionRequest:
+		request := &Request{}
+		err := json.Unmarshal(msg.Payload, request)
+		if err != nil {
+			return err
+		}
+		pk.thid = request.Thread.ID
+		state := &state{MsgType: request.Type, Current: ""}
+		return s.request(state, pk)
+	case connectionResponse:
+		response := &Response{}
+		err := json.Unmarshal(msg.Payload, response)
+		if err != nil {
+			return err
+		}
+		pk.thid = response.Thread.ID
+		state := &state{MsgType: response.Type, Current: ""}
+		return s.response(state, pk)
+	case connectionAck:
+		ack := &Ack{}
+		err := json.Unmarshal(msg.Payload, ack)
+		if err != nil {
+			return err
+		}
+		pk.thid = ack.Thread.ID
+		state := &state{MsgType: ack.Type, Current: ""}
+		return s.ack(state, pk)
+
+	default:
+		return errors.New("Message type  not supported")
+	}
+
+}
+
+func (s *Service) checkAndValidateState(state *state, pk *key) (string, error) {
+
+	if pk.thid == "" && (state.MsgType == connectionRequest || state.MsgType == connectionResponse || state.MsgType == connectionAck) {
+		return "", errors.Errorf("Thread id in the %w is empty, therefor state cannot be validated", state.MsgType)
+	}
+
+	var respBytes []byte
+	var err error
+	//fetch from store using the composite key
+	if state.MsgType == connectionInvite {
+		respBytes, err = s.store.Get(pk.String())
+		if respBytes == nil && strings.Contains(err.Error(), "not found") {
+			return nullState, nil
+		}
+	} else {
+		respBytes, err = s.store.Get(pk.String())
+		if err != nil {
+			return "", err
+		}
+	}
+	currentState, err := unmarshallResp(respBytes)
+	if err != nil {
+		return "", err
+	}
+
+	return currentState, nil
+}
+func (s *Service) persistState(state *state, pk *key) error {
+	stateBytes, err := marshallState(state)
+	if err != nil {
+		return err
+	}
+	//persist in the store
+	err = s.store.Put(pk.String(), stateBytes)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
-// Accept msg
+func (s *Service) invitation(state *state, pk *key) error {
+	//check Current state
+	currentState, err := s.checkAndValidateState(state, pk)
+	if err != nil {
+		return err
+	}
+	if currentState == nullState {
+		state.Current = invitedState
+		err := s.persistState(state, pk)
+		if err != nil {
+			return err
+
+		}
+	} else {
+		return errors.New("Required Current state : Null for invite connection")
+	}
+	return nil
+}
+
+func (s *Service) request(state *state, pk *key) error {
+	//check Current state
+	currentState, err := s.checkAndValidateState(state, pk)
+	if err != nil {
+		return err
+	}
+	if currentState == invitedState {
+		state.Current = requestedState
+		err := s.persistState(state, pk)
+		if err != nil {
+			return err
+		}
+	} else {
+		return errors.New("Required Current state : Invited  for request connection")
+	}
+	return nil
+}
+
+func (s *Service) response(state *state, pk *key) error {
+	//check Current state
+	currentState, err := s.checkAndValidateState(state, pk)
+	if err != nil {
+		return err
+	}
+	if currentState == requestedState {
+		state.Current = respondedState
+
+		err := s.persistState(state, pk)
+		if err != nil {
+			return err
+		}
+	} else {
+		return errors.New("Required Current state : Requested for response connection")
+	}
+	return nil
+}
+
+func (s *Service) ack(state *state, pk *key) error {
+	//check Current state
+	currentState, err := s.checkAndValidateState(state, pk)
+	if err != nil {
+		return err
+	}
+	if currentState == respondedState {
+		state.Current = completeState
+		err := s.persistState(state, pk)
+		if err != nil {
+			return err
+		}
+	} else {
+		return errors.New("Required Current state : Responded for ack connection")
+	}
+	return nil
+}
+
+// Accept msg checks the msg type
 func (s *Service) Accept(msgType string) bool {
-	// TODO add Accept logic
-	// for now return true
-	return true
+
+	if msgType == connectionInvite || msgType == connectionRequest || msgType == connectionResponse {
+		return true
+	}
+	return false
 }
 
 // Name return service name
 func (s *Service) Name() string {
 	return DIDExchange
+}
+
+//String prepares the composite key
+func (pk *key) String() string {
+	key := []string{pk.thid, pk.protocol, pk.version}
+	return strings.Join(key, "")
+}
+func unmarshallResp(respBytes []byte) (string, error) {
+	state := &state{}
+	err := json.Unmarshal(respBytes, state)
+	if err != nil {
+		return "", err
+	}
+	currentState := state.Current
+
+	return currentState, nil
+}
+
+func marshallState(state *state) ([]byte, error) {
+	return json.Marshal(state)
 }
 
 // Connection return connection
