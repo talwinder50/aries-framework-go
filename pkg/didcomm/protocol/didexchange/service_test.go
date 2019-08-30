@@ -8,11 +8,14 @@ package didexchange
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"testing"
 
+	"github.com/google/uuid"
 	mocktransport "github.com/hyperledger/aries-framework-go/pkg/internal/didcomm/transport/mock"
+	errors "golang.org/x/xerrors"
 
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/dispatcher"
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/protocol/decorator"
@@ -129,7 +132,8 @@ func TestCreateInvitation(t *testing.T) {
 }
 
 func TestService_Handle(t *testing.T) {
-	dbstore := setup(t)
+	dbstore, cleanup := store(t)
+	defer cleanup()
 	m := mockProvider{}
 	s := &Service{outboundTransport: m.OutboundTransport(), store: dbstore}
 
@@ -198,10 +202,88 @@ func TestService_Handle(t *testing.T) {
 	msg = dispatcher.DIDCommMsg{Type: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/yzaldh", Payload: payloadBytes}
 	err = s.Handle(msg)
 	require.Error(t, err)
-	require.Equal(t, err.Error(), "Message type  not supported")
+	require.Contains(t, err.Error(), "unrecognized msgType")
 }
+
+func TestService_Handle_StateTransitions(t *testing.T) {
+	dbstore, cleanup := store(t)
+	defer cleanup()
+	m := mockProvider{}
+	s := &Service{outboundTransport: m.OutboundTransport(), store: dbstore}
+
+	t.Run("good state transition", func(t *testing.T) {
+		thid := randomString()
+		invitation, err := json.Marshal(
+			&Invitation{
+				Type:  "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/invitation",
+				ID:    thid,
+				Label: "Alice",
+				DID:   "did:sov:QmWbsNYhMrjHiqZDTUTEJs",
+			})
+		require.NoError(t, err)
+		err = s.Handle(dispatcher.DIDCommMsg{Type: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/invitation", Payload: invitation})
+		require.NoError(t, err)
+		request, err := json.Marshal(
+			&Request{
+				Type:       "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/request",
+				ID:         randomString(),
+				Thread:     &decorator.Thread{ID: thid},
+				Label:      "test",
+				Connection: &Connection{DID: "did:example:123"},
+			},
+		)
+		require.NoError(t, err)
+		err = s.Handle(dispatcher.DIDCommMsg{Type: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/request", Payload: request})
+		require.NoError(t, err)
+	})
+
+	t.Run("bad state transition", func(t *testing.T) {
+		thid := randomString()
+		invitation, err := json.Marshal(
+			&Invitation{
+				Type:  "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/invitation",
+				ID:    thid,
+				Label: "Alice",
+				DID:   "did:sov:QmWbsNYhMrjHiqZDTUTEJs",
+			})
+		require.NoError(t, err)
+		err = s.Handle(dispatcher.DIDCommMsg{Type: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/invitation", Payload: invitation})
+		require.NoError(t, err)
+
+		response, err := json.Marshal(
+			&Response{
+				Type:   "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/response",
+				ID:     randomString(),
+				Thread: &decorator.Thread{ID: thid},
+				ConnectionSignature: &ConnectionSignature{
+					Type: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/signature/1.0/ed25519Sha512_single",
+				},
+			})
+		require.NoError(t, err)
+		err = s.Handle(dispatcher.DIDCommMsg{Type: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/response", Payload: response})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "invalid state transition")
+	})
+
+	t.Run("illegal starting state", func(t *testing.T) {
+		response, err := json.Marshal(
+			&Response{
+				Type: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/response",
+				ID:   randomString(),
+				ConnectionSignature: &ConnectionSignature{
+					Type: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/signature/1.0/ed25519Sha512_single",
+				},
+			})
+		require.NoError(t, err)
+		err = s.Handle(dispatcher.DIDCommMsg{Type: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/response", Payload: response})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "invalid state transition")
+	})
+}
+
 func TestService_Accept(t *testing.T) {
-	dbstore := setup(t)
+	dbstore, cleanup := store(t)
+	defer cleanup()
 	m := mockProvider{}
 	s := &Service{outboundTransport: m.OutboundTransport(), store: dbstore}
 
@@ -214,60 +296,81 @@ func TestService_Accept(t *testing.T) {
 	resp = s.Accept("did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/response")
 	require.Equal(t, true, resp)
 
+	resp = s.Accept("did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/ack")
+	require.Equal(t, true, resp)
+
 	resp = s.Accept("unsupported msg type")
 	require.Equal(t, false, resp)
+}
+
+func TestService_threadID(t *testing.T) {
+	t.Run("returns thid contained in msg", func(t *testing.T) {
+		const expected = "123456"
+		msg := fmt.Sprintf(`{"~thread": {"thid": "%s"}}`, expected)
+		actual, err := threadID([]byte(msg))
+		require.NoError(t, err)
+		require.Equal(t, expected, actual)
+	})
+	t.Run("returns empty thid when msg does not contain thid", func(t *testing.T) {
+		const expected = ""
+		actual, err := threadID([]byte("{}"))
+		require.NoError(t, err)
+		require.Equal(t, expected, actual)
+	})
 
 }
 
-func TestCheckAndPersistState(t *testing.T) {
-	dbstore := setup(t)
-	m := mockProvider{}
-	s := &Service{outboundTransport: m.OutboundTransport(), store: dbstore}
+func TestService_currentState(t *testing.T) {
+	t.Run("null state if not found in store", func(t *testing.T) {
+		svc := &Service{
+			store: &mockStore{
+				get: func(string) ([]byte, error) { return nil, errors.New("not found") },
+			},
+		}
+		state, err := svc.currentState("ignored")
+		require.NoError(t, err)
+		require.Equal(t, (&null{}).Name(), state.Name())
+	})
+	t.Run("returns state from store", func(t *testing.T) {
+		expected := &requested{}
+		svc := &Service{
+			store: &mockStore{
+				get: func(string) ([]byte, error) { return []byte(expected.Name()), nil },
+			},
+		}
+		actual, err := svc.currentState("ignored")
+		require.NoError(t, err)
+		require.Equal(t, expected.Name(), actual.Name())
+	})
+}
 
-	state1 := &state{MsgType: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/invitation", Current: nullState}
-	pk1 := &key{protocol: "didexchange", version: "1.0", thid: "12345678900987654321"}
+func TestService_update(t *testing.T) {
+	const thid = "123"
+	state := &responded{}
+	data := make(map[string][]byte)
+	store := &mockStore{
+		put: func(k string, v []byte) error {
+			data[k] = v
+			return nil
+		},
+	}
+	require.NoError(t, (&Service{store: store}).update("123", state))
+	require.Equal(t, state.Name(), string(data[thid]))
+}
 
-	err := s.persistState(state1, pk1)
-	require.NoError(t, err)
+type mockStore struct {
+	put func(string, []byte) error
+	get func(string) ([]byte, error)
+}
 
-	state2 := &state{MsgType: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/invitation", Current: ""}
-	pk2 := &key{protocol: "didexchange", version: "1.0", thid: "12345678900987654321"}
-	currentState, err := s.checkAndValidateState(state2, pk2)
-	require.Equal(t, nullState, currentState)
-	require.NoError(t, err)
+// Put stores the key and the record
+func (m *mockStore) Put(k string, v []byte) error {
+	return m.put(k, v)
+}
 
-	state3 := &state{MsgType: "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/didexchange/1.0/request", Current: invitedState}
-	pk3 := &key{protocol: "didexchange", version: "1.0", thid: "12345678900987654321"}
-
-	err = s.persistState(state3, pk3)
-	require.NoError(t, err)
-
-	currentState, err = s.checkAndValidateState(state3, pk3)
-	require.NoError(t, err)
-	require.Equal(t, invitedState, currentState)
-
-	//empty thread id in the request
-	pk4 := &key{protocol: "didexchange", version: "1.0", thid: ""}
-	currentState, err = s.checkAndValidateState(state3, pk4)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "state cannot be validated")
-	require.Equal(t, currentState, "")
-
-	//key not found in the db and message type is request
-	pk4 = &key{protocol: "didexchange", version: "1.0", thid: "12345678900987654340"}
-	currentState, err = s.checkAndValidateState(state3, pk4)
-	require.Error(t, err)
-	require.Equal(t, err.Error(), "leveldb: not found")
-	require.Equal(t, "", currentState)
-
-	state4 := &state{}
-	pk5 := &key{}
-
-	// persist - empty key
-	err = s.persistState(state4, pk5)
-	require.Error(t, err)
-	require.Equal(t, err.Error(), "Key and value are mandatory")
-
+// Get fetches the record based on key
+func (m *mockStore) Get(k string) ([]byte, error) {
+	return m.get(k)
 }
 
 type mockProvider struct {
@@ -277,17 +380,16 @@ func (p *mockProvider) OutboundTransport() transport.OutboundTransport {
 	return mocktransport.NewOutboundTransport(successResponse)
 }
 
-func setup(t testing.TB) storage.Store {
-	path, cleanup := setupLevelDB(t)
-	defer cleanup()
+func store(t testing.TB) (store storage.Store, cleanup func()) {
+	path, cleanup := tempDir(t)
 
 	prov, err := leveldb.NewProvider(path)
 	require.NoError(t, err)
 	dbstore, err := prov.GetStoreHandle()
 	require.NoError(t, err)
-	return dbstore
+	return dbstore, cleanup
 }
-func setupLevelDB(t testing.TB) (string, func()) {
+func tempDir(t testing.TB) (string, func()) {
 	dbPath, err := ioutil.TempDir("", "db")
 	if err != nil {
 		t.Fatalf("Failed to create leveldb directory: %s", err)
@@ -298,4 +400,9 @@ func setupLevelDB(t testing.TB) (string, func()) {
 			t.Fatalf("Failed to clear leveldb directory: %s", err)
 		}
 	}
+}
+
+func randomString() string {
+	uuid := uuid.New()
+	return uuid.String()
 }
