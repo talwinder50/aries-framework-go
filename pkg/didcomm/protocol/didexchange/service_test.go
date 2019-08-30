@@ -382,13 +382,13 @@ func (p *mockProvider) OutboundTransport() transport.OutboundTransport {
 
 func store(t testing.TB) (store storage.Store, cleanup func()) {
 	path, cleanup := tempDir(t)
-
 	prov, err := leveldb.NewProvider(path)
 	require.NoError(t, err)
 	dbstore, err := prov.GetStoreHandle()
 	require.NoError(t, err)
 	return dbstore, cleanup
 }
+
 func tempDir(t testing.TB) (string, func()) {
 	dbPath, err := ioutil.TempDir("", "db")
 	if err != nil {

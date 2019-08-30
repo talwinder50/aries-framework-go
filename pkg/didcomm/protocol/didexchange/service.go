@@ -42,6 +42,22 @@ type Service struct {
 	store             storage.Store
 }
 
+//state defines a didcomm service state
+type state struct {
+	MsgType string `json:"@type"`
+	Current string
+}
+
+//key struct prepares the composite key for state persitance and lookup
+type key struct {
+	//protocol is defined in the msg type url for example "didexchange"
+	protocol string
+	//version is derived from msg type as well
+	version string
+	//thread id of the request
+	thid string
+}
+
 // New return didexchange service
 func New(store storage.Store, prov provider) *Service {
 	return &Service{outboundTransport: prov.OutboundTransport(), store: store}
@@ -123,6 +139,26 @@ func (s *Service) Accept(msgType string) bool {
 // Name return service name
 func (s *Service) Name() string {
 	return DIDExchange
+}
+
+//String prepares the composite key
+func (pk *key) String() string {
+	key := []string{pk.thid, pk.protocol, pk.version}
+	return strings.Join(key, "")
+}
+func unmarshallResp(respBytes []byte) (string, error) {
+	state := &state{}
+	err := json.Unmarshal(respBytes, state)
+	if err != nil {
+		return "", err
+	}
+	currentState := state.Current
+
+	return currentState, nil
+}
+
+func marshallState(state *state) ([]byte, error) {
+	return json.Marshal(state)
 }
 
 // Connection return connection
