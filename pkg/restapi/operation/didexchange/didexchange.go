@@ -72,13 +72,13 @@ func (c *Operation) CreateInvitation(rw http.ResponseWriter, req *http.Request, 
 	logger.Debugf("Creating connection invitation ")
 
 	// call didexchange client
-	response, err := c.didExchangeClient.CreateInvitation()
+	invitation, err := c.didExchangeClient.CreateInvitation()
 	if err != nil {
 		c.writeGenericError(rw, err)
 		return
 	}
 
-	err = json.NewEncoder(rw).Encode(&response.Invitation)
+	err = json.NewEncoder(rw).Encode(&invitation)
 	if err != nil {
 		logger.Errorf("Unable to send response, %s", err)
 	}

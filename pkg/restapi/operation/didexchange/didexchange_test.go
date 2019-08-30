@@ -59,13 +59,13 @@ func TestExchangeService_CreateInvitation(t *testing.T) {
 	buf, err := getResponseFromHandler(handler, nil)
 	require.NoError(t, err)
 
-	response := didexchange.Invitation{}
+	response := didexchange.InvitationRequest{}
 	err = json.Unmarshal(buf.Bytes(), &response)
 	require.NoError(t, err)
 
 	//verify response
-	require.NotEmpty(t, response.ID)
-	require.NotEmpty(t, response.Label)
+	require.NotEmpty(t, response.Invitation.ID)
+	require.NotEmpty(t, response.Invitation.Label)
 }
 
 func TestExchangeService_WriteGenericError(t *testing.T) {
